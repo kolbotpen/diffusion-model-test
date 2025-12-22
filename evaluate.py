@@ -1,35 +1,323 @@
-"""
-Evaluation script for the diffusion model.
-"""
-
+import torch
+from diffusers import DDPMScheduler
+import matplotlib.pyplot as plt
 import os
-import argparse
+from network import UNet
+from tqdm import tqdm
 
 
-def evaluate(model_path, test_data_path):
+def generate_digits_with_visualization(
+    model_path='output/model_final.pt',
+    digit_labels=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+    num_samples_per_digit=5,
+    num_inference_steps=1000,
+    device=None,
+    save_dir='output/generated_samples',
+    show_interval=50  # Update display every N steps
+):
     """
-    Evaluate the trained diffusion model.
+    Generate MNIST-like digit images with LIVE on-screen visualization of the denoising process.
     
     Args:
-        model_path: Path to trained model checkpoint
-        test_data_path: Path to test data
+        model_path: Path to the trained model checkpoint
+        digit_labels: List of digit labels to generate (0-9)
+        num_samples_per_digit: Number of samples to generate per digit
+        num_inference_steps: Number of denoising steps
+        device: Device to run inference on
+        save_dir: Directory to save generated images
+        show_interval: Update the live display every N steps
     """
-    print(f"Evaluating model from {model_path}")
-    print(f"Using test data from {test_data_path}")
+    os.makedirs(save_dir, exist_ok=True)
     
-    # TODO: Implement evaluation logic
+    # Auto-detect device
+    if device is None:
+        if torch.cuda.is_available():
+            device = 'cuda'
+        elif torch.backends.mps.is_available():
+            device = 'mps'
+        else:
+            device = 'cpu'
     
-    print("Evaluation complete!")
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Evaluate diffusion model")
-    parser.add_argument("--model_path", type=str, required=True, help="Path to model checkpoint")
-    parser.add_argument("--test_data", type=str, default="data/validation.csv", help="Path to test data")
+    print(f"Using device: {device}")
     
-    args = parser.parse_args()
-    evaluate(args.model_path, args.test_data)
+    # Load model
+    model = UNet(
+        image_channels=1,
+        base_channels=64,
+        time_embedding_dim=128,
+        text_embedding_dim=128,
+        num_classes=10
+    ).to(device)
+    
+    checkpoint = torch.load(model_path, map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+    
+    # Initialize scheduler
+    noise_scheduler = DDPMScheduler(
+        num_train_timesteps=num_inference_steps,
+        beta_schedule="squaredcos_cap_v2"
+    )
+    
+    print(f"\n{'='*60}")
+    print(f"🎨 Generating {num_samples_per_digit} samples per digit with LIVE visualization")
+    print(f"📊 Total denoising steps: {num_inference_steps}")
+    print(f"🖼️  Display updates every {show_interval} steps")
+    print(f"{'='*60}\n")
+    
+    # Enable interactive mode for live updates
+    plt.ion()
+    
+    # Generate multiple samples per digit with LIVE visualization
+    with torch.no_grad():
+        for digit in digit_labels:
+            print(f"\n🔢 Generating {num_samples_per_digit} samples for digit: {digit}")
+            
+            # Create batch of labels
+            labels = torch.tensor([digit] * num_samples_per_digit, device=device)
+            images = torch.randn((num_samples_per_digit, 1, 28, 28), device=device)
+            
+            noise_scheduler.set_timesteps(num_inference_steps)
+            timesteps_list = noise_scheduler.timesteps.tolist()
+            
+            # Create figure for live display - show all samples in a row
+            fig, axes = plt.subplots(1, num_samples_per_digit, figsize=(num_samples_per_digit * 3, 3))
+            if num_samples_per_digit == 1:
+                axes = [axes]
+            fig.suptitle(f'Generating Digit {digit} - LIVE ({num_samples_per_digit} samples)', 
+                        fontsize=16, fontweight='bold')
+            
+            # Denoising loop with live display
+            for step_idx, t in enumerate(tqdm(timesteps_list, desc=f"  Denoising")):
+                timesteps = torch.full((num_samples_per_digit,), t, device=device, dtype=torch.long)
+                noise_pred = model(images, timesteps, labels)
+                images = noise_scheduler.step(noise_pred, t, images).prev_sample
+                
+                # Update display at intervals
+                if step_idx % show_interval == 0 or step_idx == len(timesteps_list) - 1:
+                    imgs_normalized = (images + 1) / 2
+                    imgs_normalized = torch.clamp(imgs_normalized, 0, 1)
+                    
+                    # Update all subplots
+                    for idx in range(num_samples_per_digit):
+                        current_img = imgs_normalized[idx].cpu().squeeze().numpy()
+                        axes[idx].clear()
+                        axes[idx].imshow(current_img, cmap='gray')
+                        axes[idx].axis('off')
+                        progress_percent = (step_idx / len(timesteps_list)) * 100
+                        axes[idx].set_title(f'Sample {idx+1}\nStep {step_idx}\n{progress_percent:.0f}%', 
+                                          fontsize=10)
+                    
+                    plt.tight_layout()
+                    plt.pause(0.01)  # Small pause to update display
+            
+            # Final images
+            final_images = (images + 1) / 2
+            final_images = torch.clamp(final_images, 0, 1)
+            
+            # Show final result for a bit longer
+            for idx in range(num_samples_per_digit):
+                axes[idx].clear()
+                axes[idx].imshow(final_images[idx].cpu().squeeze().numpy(), cmap='gray')
+                axes[idx].axis('off')
+                axes[idx].set_title(f'Sample {idx+1}\n✅ COMPLETE', fontsize=11, fontweight='bold')
+            
+            fig.suptitle(f'✅ Digit {digit} Complete - {num_samples_per_digit} Samples Generated', 
+                        fontsize=16, fontweight='bold')
+            plt.tight_layout()
+            plt.pause(2.0)  # Pause longer to view final results
+            
+            # Save the grid
+            grid_path = os.path.join(save_dir, f'digit_{digit}_samples.png')
+            plt.savefig(grid_path, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+            print(f"  ✅ Saved: {grid_path}")
+    
+    # Turn off interactive mode
+    plt.ioff()
+    
+    # Generate combined grid of all final digits
+    print(f"\n{'='*60}")
+    print("🎨 Creating combined grid of all digits...")
+    all_images = []
+    
+    with torch.no_grad():
+        for digit in tqdm(digit_labels, desc="Generating final grid"):
+            labels = torch.tensor([digit], device=device)
+            image = torch.randn((1, 1, 28, 28), device=device)
+            
+            noise_scheduler.set_timesteps(num_inference_steps)
+            for t in noise_scheduler.timesteps:
+                timesteps = torch.full((1,), t, device=device, dtype=torch.long)
+                noise_pred = model(image, timesteps, labels)
+                image = noise_scheduler.step(noise_pred, t, image).prev_sample
+            
+            image = (image + 1) / 2
+            image = torch.clamp(image, 0, 1)
+            all_images.append(image.cpu().squeeze().numpy())
+    
+    # Plot grid
+    fig, axes = plt.subplots(1, len(digit_labels), figsize=(len(digit_labels) * 2, 2))
+    fig.suptitle('All Generated Digits (0-9)', fontsize=16, fontweight='bold')
+    
+    for idx, (digit, img) in enumerate(zip(digit_labels, all_images)):
+        axes[idx].imshow(img, cmap='gray')
+        axes[idx].axis('off')
+        axes[idx].set_title(f'{digit}', fontsize=14)
+    
+    plt.tight_layout()
+    grid_path = os.path.join(save_dir, 'all_digits_grid.png')
+    plt.savefig(grid_path, dpi=150, bbox_inches='tight')
+    plt.show()  # Show the final grid
+    print(f"✅ Saved combined grid: {grid_path}")
+    
+    print(f"\n{'='*60}")
+    print("🎉 Generation complete!")
+    print(f"📁 Check '{save_dir}/' for saved images")
+    print(f"{'='*60}\n")
 
 
-if __name__ == "__main__":
-    main()
+def generate_digits(
+    model_path='output/model_final.pt',
+    digit_labels=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+    num_samples_per_digit=5,
+    num_inference_steps=1000,
+    device=None,
+    save_dir='output/generated_samples'
+):
+    """
+    Generate MNIST-like digit images from text (digit labels).
+    
+    Args:
+        model_path: Path to the trained model checkpoint
+        digit_labels: List of digit labels to generate (0-9)
+        num_samples_per_digit: Number of samples to generate for each digit
+        num_inference_steps: Number of denoising steps
+        device: Device to run inference on
+        save_dir: Directory to save generated images
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Auto-detect device
+    if device is None:
+        if torch.cuda.is_available():
+            device = 'cuda'
+        elif torch.backends.mps.is_available():
+            device = 'mps'
+        else:
+            device = 'cpu'
+    
+    # Load model
+    model = UNet(
+        image_channels=1,
+        base_channels=64,
+        time_embedding_dim=128,
+        text_embedding_dim=128,
+        num_classes=10
+    ).to(device)
+    
+    checkpoint = torch.load(model_path, map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+    
+    # Initialize scheduler
+    noise_scheduler = DDPMScheduler(
+        num_train_timesteps=num_inference_steps,
+        beta_schedule="squaredcos_cap_v2"
+    )
+    
+    print(f"Generating {num_samples_per_digit} samples for each digit: {digit_labels}")
+    print(f"Using {num_inference_steps} inference steps")
+    
+    with torch.no_grad():
+        for digit in digit_labels:
+            print(f"\nGenerating digit: {digit}")
+            
+            # Create batch of labels
+            labels = torch.tensor([digit] * num_samples_per_digit, device=device)
+            
+            # Start from pure noise
+            image_shape = (num_samples_per_digit, 1, 28, 28)
+            images = torch.randn(image_shape, device=device)
+            
+            # Denoising loop
+            noise_scheduler.set_timesteps(num_inference_steps)
+            
+            for t in noise_scheduler.timesteps:
+                # Predict noise
+                timesteps = torch.full((num_samples_per_digit,), t, device=device, dtype=torch.long)
+                noise_pred = model(images, timesteps, labels)
+                
+                # Denoise step
+                images = noise_scheduler.step(noise_pred, t, images).prev_sample
+            
+            # Denormalize images from [-1, 1] to [0, 1]
+            images = (images + 1) / 2
+            images = torch.clamp(images, 0, 1)
+            
+            # Plot and save results
+            fig, axes = plt.subplots(1, num_samples_per_digit, figsize=(num_samples_per_digit * 2, 2))
+            if num_samples_per_digit == 1:
+                axes = [axes]
+            
+            for idx in range(num_samples_per_digit):
+                img = images[idx].cpu().squeeze().numpy()
+                axes[idx].imshow(img, cmap='gray')
+                axes[idx].axis('off')
+                axes[idx].set_title(f'Digit {digit}')
+            
+            plt.tight_layout()
+            save_path = os.path.join(save_dir, f'digit_{digit}.png')
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            plt.close()
+            print(f"Saved: {save_path}")
+    
+    # Generate a grid of all digits
+    print("\nGenerating combined grid of all digits...")
+    all_images = []
+    
+    with torch.no_grad():
+        for digit in digit_labels:
+            labels = torch.tensor([digit], device=device)
+            image = torch.randn((1, 1, 28, 28), device=device)
+            
+            noise_scheduler.set_timesteps(num_inference_steps)
+            for t in noise_scheduler.timesteps:
+                timesteps = torch.full((1,), t, device=device, dtype=torch.long)
+                noise_pred = model(image, timesteps, labels)
+                image = noise_scheduler.step(noise_pred, t, image).prev_sample
+            
+            image = (image + 1) / 2
+            image = torch.clamp(image, 0, 1)
+            all_images.append(image.cpu().squeeze().numpy())
+    
+    # Plot grid
+    fig, axes = plt.subplots(1, len(digit_labels), figsize=(len(digit_labels) * 2, 2))
+    for idx, (digit, img) in enumerate(zip(digit_labels, all_images)):
+        axes[idx].imshow(img, cmap='gray')
+        axes[idx].axis('off')
+        axes[idx].set_title(f'{digit}', fontsize=16)
+    
+    plt.tight_layout()
+    grid_path = os.path.join(save_dir, 'all_digits_grid.png')
+    plt.savefig(grid_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved grid: {grid_path}")
+    
+    print("\nGeneration complete!")
+
+
+if __name__ == '__main__':
+    # Generate samples with LIVE on-screen visualization
+    print("\n🎬 Starting generation with LIVE on-screen display!\n")
+    print("👀 Watch 5 samples transform from noise to digit in real-time!\n")
+    
+    generate_digits_with_visualization(
+        model_path='output/model_final.pt',
+        digit_labels=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        num_samples_per_digit=5,
+        num_inference_steps=1000,
+        show_interval=50  # Update display every 50 steps
+    )
+
+

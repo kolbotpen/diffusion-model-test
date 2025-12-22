@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# Data files (MNIST dataset is large)
+data/
+*.csv
+!data/README.md
+
+# Model outputs and checkpoints (can be very large)
+output/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Generated samples (images)
+*.png
+*.jpg
+*.jpeg
+!README*.png
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+*.log
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
