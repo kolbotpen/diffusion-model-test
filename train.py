@@ -18,10 +18,6 @@ def train_diffusion_model(
     device=None,
     save_dir='output'
 ):
-    """
-    Train a text-conditional diffusion model on MNIST dataset.
-    """
-    # Auto-detect best device
     if device is None:
         if torch.cuda.is_available():
             device = 'cuda'
@@ -30,13 +26,11 @@ def train_diffusion_model(
         else:
             device = 'cpu'
     
-    # Create save directory
     os.makedirs(save_dir, exist_ok=True)
     
-    # Setup data
     transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.5,), (0.5,))  # Normalize to [-1, 1]
+        transforms.Normalize((0.5,), (0.5,))
     ])
     
     train_dataset = datasets.MNIST(
@@ -51,10 +45,9 @@ def train_diffusion_model(
         batch_size=batch_size,
         shuffle=True,
         num_workers=4,
-        pin_memory=(device == 'cuda')  # Only use pin_memory for CUDA
+        pin_memory=(device == 'cuda')
     )
     
-    # Initialize model
     model = UNet(
         image_channels=1,
         base_channels=64,
@@ -63,19 +56,15 @@ def train_diffusion_model(
         num_classes=10
     ).to(device)
     
-    # Initialize DDPM scheduler
     noise_scheduler = DDPMScheduler(
         num_train_timesteps=num_timesteps,
         beta_schedule="squaredcos_cap_v2"
     )
     
-    # Optimizer
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
     
-    # Loss function
     criterion = nn.MSELoss()
     
-    # Training loop
     print(f"Training on device: {device}")
     print(f"Number of epochs: {num_epochs}")
     print(f"Batch size: {batch_size}")
@@ -90,23 +79,18 @@ def train_diffusion_model(
             images = images.to(device)
             labels = labels.to(device)
             
-            # Sample random timesteps for each image
             timesteps = torch.randint(
                 0, num_timesteps, (images.shape[0],), device=device
             ).long()
             
-            # Add noise to images
             noise = torch.randn_like(images)
             noisy_images = noise_scheduler.add_noise(images, noise, timesteps)
             
-            # Predict noise
             optimizer.zero_grad()
             noise_pred = model(noisy_images, timesteps, labels)
             
-            # Calculate loss
             loss = criterion(noise_pred, noise)
             
-            # Backpropagation
             loss.backward()
             optimizer.step()
             
@@ -116,7 +100,6 @@ def train_diffusion_model(
         avg_loss = epoch_loss / len(train_loader)
         print(f"Epoch {epoch+1}/{num_epochs}, Average Loss: {avg_loss:.6f}")
         
-        # Save checkpoint every 10 epochs
         if (epoch + 1) % 10 == 0:
             checkpoint_path = os.path.join(save_dir, f'model_epoch_{epoch+1}.pt')
             torch.save({
@@ -127,7 +110,6 @@ def train_diffusion_model(
             }, checkpoint_path)
             print(f"Checkpoint saved: {checkpoint_path}")
     
-    # Save final model
     final_model_path = os.path.join(save_dir, 'model_final.pt')
     torch.save({
         'epoch': num_epochs,
@@ -141,7 +123,6 @@ def train_diffusion_model(
 
 
 if __name__ == '__main__':
-    # Train the model
     model, scheduler = train_diffusion_model(
         num_epochs=50,
         batch_size=128,
