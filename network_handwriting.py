@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers import DDPMScheduler
 import numpy as np
+import math
 
 
 class SinusoidalPositionEmbeddings(nn.Module):
@@ -19,108 +20,225 @@ class SinusoidalPositionEmbeddings(nn.Module):
         embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
         return embeddings
 
-class CharacterEmbedding(nn.Module):
-    """Embeds text prompts as sequences of characters"""
+
+def get_sinusoidal_position_encoding(seq_len, dim, device):
+    """Generate sinusoidal position encodings"""
+    position = torch.arange(seq_len, device=device).unsqueeze(1)
+    div_term = torch.exp(torch.arange(0, dim, 2, device=device) * (-math.log(10000.0) / dim))
+    
+    pe = torch.zeros(seq_len, dim, device=device)
+    pe[:, 0::2] = torch.sin(position * div_term)
+    pe[:, 1::2] = torch.cos(position * div_term)
+    return pe
+
+
+class TextEncoder(nn.Module):
+    """Encodes text as a sequence with positional information preserved"""
     def __init__(self, vocab_size=128, embed_dim=256, max_seq_len=32):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim)
-        self.pos_embedding = nn.Embedding(max_seq_len, embed_dim)
         self.max_seq_len = max_seq_len
+        self.embed_dim = embed_dim
         
     def forward(self, char_indices):
+        # char_indices: (batch, seq_len)
         batch_size, seq_len = char_indices.shape
         
+        # Character embeddings
         char_emb = self.embedding(char_indices)  # (batch, seq_len, embed_dim)
         
-        # Positional embeddings
-        positions = torch.arange(seq_len, device=char_indices.device)
-        pos_emb = self.pos_embedding(positions)  # (seq_len, embed_dim)
+        # Add sinusoidal positional encodings
+        pos_enc = get_sinusoidal_position_encoding(seq_len, self.embed_dim, char_indices.device)
+        text_seq = char_emb + pos_enc.unsqueeze(0)  # (batch, seq_len, embed_dim)
         
-        # Combine
-        embeddings = char_emb + pos_emb.unsqueeze(0)  # (batch, seq_len, embed_dim)
-        
-        # Average pooling over sequence
-        embeddings = embeddings.mean(dim=1)  # (batch, embed_dim)
-        
-        return embeddings
+        return text_seq  # Return as sequence, not averaged
 
 
-class Block(nn.Module):
-    def __init__(self, channels_in, channels_out, time_embedding_dim, text_embedding_dim):
+class ConditionalAffineTransform(nn.Module):
+    """Affine transformation conditioned on time/noise level"""
+    def __init__(self, channels, condition_dim):
+        super().__init__()
+        self.scale_shift = nn.Linear(condition_dim, channels * 2)
+        
+    def forward(self, x, condition):
+        # x: (batch, channels, height, width)
+        # condition: (batch, condition_dim)
+        scale_shift = self.scale_shift(condition)
+        scale, shift = scale_shift.chunk(2, dim=1)
+        
+        # Apply affine transformation along channel axis
+        x = x * (1 + scale[:, :, None, None]) + shift[:, :, None, None]
+        return x
+
+
+class ConvBlock(nn.Module):
+    """Convolutional block with 3 conv layers and conditional affine transformations"""
+    def __init__(self, channels_in, channels_out, time_embedding_dim):
         super().__init__()
         self.conv1 = nn.Conv2d(channels_in, channels_out, kernel_size=3, padding=1)
         self.conv2 = nn.Conv2d(channels_out, channels_out, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv2d(channels_out, channels_out, kernel_size=3, padding=1)
+        
         self.norm1 = nn.GroupNorm(8, channels_out)
         self.norm2 = nn.GroupNorm(8, channels_out)
+        self.norm3 = nn.GroupNorm(8, channels_out)
         
-        self.time_mlp = nn.Linear(time_embedding_dim, channels_out)
-        self.text_mlp = nn.Linear(text_embedding_dim, channels_out)
+        # Conditional affine transformations
+        self.affine1 = ConditionalAffineTransform(channels_out, time_embedding_dim)
+        self.affine2 = ConditionalAffineTransform(channels_out, time_embedding_dim)
+        self.affine3 = ConditionalAffineTransform(channels_out, time_embedding_dim)
         
         self.residual_conv = nn.Conv2d(channels_in, channels_out, kernel_size=1) if channels_in != channels_out else nn.Identity()
     
-    def forward(self, x, time_emb, text_emb):
+    def forward(self, x, time_emb):
         residual = self.residual_conv(x)
         
         # First conv
         x = self.conv1(x)
         x = self.norm1(x)
-        
-        # Add time conditioning
-        time_emb = self.time_mlp(time_emb)
-        x = x + time_emb[:, :, None, None]
-        
-        # Add text conditioning
-        text_emb = self.text_mlp(text_emb)
-        x = x + text_emb[:, :, None, None]
-        
+        x = self.affine1(x, time_emb)
         x = F.relu(x)
         
         # Second conv
         x = self.conv2(x)
         x = self.norm2(x)
-        x = F.relu(x + residual)
+        x = self.affine2(x, time_emb)
+        x = F.relu(x)
+        
+        # Third conv
+        x = self.conv3(x)
+        x = self.norm3(x)
+        x = self.affine3(x, time_emb)
+        
+        return F.relu(x + residual)
+
+
+class AttentionBlock(nn.Module):
+    """Attention block with cross-attention to text and self-attention"""
+    def __init__(self, channels, text_dim, num_heads=8):
+        super().__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+        
+        # Cross-attention to text
+        self.cross_attn = nn.MultiheadAttention(channels, num_heads, batch_first=True)
+        self.cross_attn_norm = nn.LayerNorm(channels)
+        
+        # Self-attention
+        self.self_attn = nn.MultiheadAttention(channels, num_heads, batch_first=True)
+        self.self_attn_norm = nn.LayerNorm(channels)
+        
+        # Feed-forward network
+        self.ffn = nn.Sequential(
+            nn.Linear(channels, channels * 4),
+            nn.GELU(),
+            nn.Linear(channels * 4, channels)
+        )
+        self.ffn_norm = nn.LayerNorm(channels)
+        
+        # Project text to match channel dimension
+        self.text_proj = nn.Linear(text_dim, channels)
+        
+    def forward(self, x, text_seq, time_emb):
+        # x: (batch, channels, H, W)
+        # text_seq: (batch, seq_len, text_dim)
+        
+        batch, channels, h, w = x.shape
+        
+        # Reshape to sequence
+        x_seq = x.view(batch, channels, h * w).permute(0, 2, 1)  # (batch, H*W, channels)
+        
+        # Add positional encodings to queries and keys
+        spatial_pos = get_sinusoidal_position_encoding(h * w, channels, x.device)
+        
+        # Cross-attention with text
+        text_proj = self.text_proj(text_seq)  # (batch, seq_len, channels)
+        text_pos = get_sinusoidal_position_encoding(text_seq.shape[1], channels, x.device)
+        
+        q = x_seq + spatial_pos.unsqueeze(0)
+        k = text_proj + text_pos.unsqueeze(0)
+        v = text_proj
+        
+        attn_out, _ = self.cross_attn(q, k, v)
+        x_seq = self.cross_attn_norm(x_seq + attn_out)
+        
+        # Self-attention
+        q_self = x_seq + spatial_pos.unsqueeze(0)
+        k_self = x_seq + spatial_pos.unsqueeze(0)
+        
+        self_attn_out, _ = self.self_attn(q_self, k_self, x_seq)
+        x_seq = self.self_attn_norm(x_seq + self_attn_out)
+        
+        # Feed-forward
+        ffn_out = self.ffn(x_seq)
+        x_seq = self.ffn_norm(x_seq + ffn_out)
+        
+        # Reshape back to spatial
+        x = x_seq.permute(0, 2, 1).view(batch, channels, h, w)
         
         return x
 
 
 class UNetHandwriting(nn.Module):
-    """UNet architecture for handwriting generation (64x256 images)"""
+    """UNet architecture for handwriting generation (64x256 images) with attention"""
     def __init__(self, 
                 image_channels=1,
                 base_channels=64,
                 time_embedding_dim=256,
                 text_embedding_dim=256,
                 vocab_size=128,
-                max_seq_len=32):
+                max_seq_len=32,
+                num_heads=8):
         super().__init__()
         
         self.time_embedding = SinusoidalPositionEmbeddings(time_embedding_dim)
-        self.text_embedding = CharacterEmbedding(vocab_size, text_embedding_dim, max_seq_len)
+        self.text_encoder = TextEncoder(vocab_size, text_embedding_dim, max_seq_len)
+        
+        # Time embedding MLP (2 fully connected layers as per paper)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(time_embedding_dim, time_embedding_dim * 4),
+            nn.GELU(),
+            nn.Linear(time_embedding_dim * 4, time_embedding_dim)
+        )
         
         # Initial projection
         self.initial_conv = nn.Conv2d(image_channels, base_channels, kernel_size=3, padding=1)
         
-        # Encoder (downsampling)
-        self.down1 = Block(base_channels, base_channels, time_embedding_dim, text_embedding_dim)
-        self.down2 = Block(base_channels, base_channels * 2, time_embedding_dim, text_embedding_dim)
-        self.down3 = Block(base_channels * 2, base_channels * 4, time_embedding_dim, text_embedding_dim)
-        self.down4 = Block(base_channels * 4, base_channels * 8, time_embedding_dim, text_embedding_dim)
+        # Encoder (downsampling) - using ConvBlocks + AttentionBlocks
+        self.down_conv1 = ConvBlock(base_channels, base_channels, time_embedding_dim)
+        self.down_attn1 = AttentionBlock(base_channels, text_embedding_dim, num_heads)
+        
+        self.down_conv2 = ConvBlock(base_channels, base_channels * 2, time_embedding_dim)
+        self.down_attn2 = AttentionBlock(base_channels * 2, text_embedding_dim, num_heads)
+        
+        self.down_conv3 = ConvBlock(base_channels * 2, base_channels * 4, time_embedding_dim)
+        self.down_attn3 = AttentionBlock(base_channels * 4, text_embedding_dim, num_heads)
+        
+        self.down_conv4 = ConvBlock(base_channels * 4, base_channels * 8, time_embedding_dim)
+        self.down_attn4 = AttentionBlock(base_channels * 8, text_embedding_dim, num_heads)
         
         self.pool = nn.MaxPool2d(2)
         
         # Bottleneck
-        self.bottleneck = Block(base_channels * 8, base_channels * 8, time_embedding_dim, text_embedding_dim)
+        self.bottleneck_conv = ConvBlock(base_channels * 8, base_channels * 8, time_embedding_dim)
+        self.bottleneck_attn = AttentionBlock(base_channels * 8, text_embedding_dim, num_heads)
         
         # Decoder (upsampling)
         self.upconv1 = nn.ConvTranspose2d(base_channels * 8, base_channels * 8, kernel_size=2, stride=2)
-        self.upconv2 = nn.ConvTranspose2d(base_channels * 4, base_channels * 4, kernel_size=2, stride=2)
-        self.upconv3 = nn.ConvTranspose2d(base_channels * 2, base_channels * 2, kernel_size=2, stride=2)
-        self.upconv4 = nn.ConvTranspose2d(base_channels, base_channels, kernel_size=2, stride=2)
+        self.up_conv1 = ConvBlock(base_channels * 16, base_channels * 4, time_embedding_dim)
+        self.up_attn1 = AttentionBlock(base_channels * 4, text_embedding_dim, num_heads)
         
-        self.up1 = Block(base_channels * 16, base_channels * 4, time_embedding_dim, text_embedding_dim)
-        self.up2 = Block(base_channels * 8, base_channels * 2, time_embedding_dim, text_embedding_dim)
-        self.up3 = Block(base_channels * 4, base_channels, time_embedding_dim, text_embedding_dim)
-        self.up4 = Block(base_channels * 2, base_channels, time_embedding_dim, text_embedding_dim)
+        self.upconv2 = nn.ConvTranspose2d(base_channels * 4, base_channels * 4, kernel_size=2, stride=2)
+        self.up_conv2 = ConvBlock(base_channels * 8, base_channels * 2, time_embedding_dim)
+        self.up_attn2 = AttentionBlock(base_channels * 2, text_embedding_dim, num_heads)
+        
+        self.upconv3 = nn.ConvTranspose2d(base_channels * 2, base_channels * 2, kernel_size=2, stride=2)
+        self.up_conv3 = ConvBlock(base_channels * 4, base_channels, time_embedding_dim)
+        self.up_attn3 = AttentionBlock(base_channels, text_embedding_dim, num_heads)
+        
+        self.upconv4 = nn.ConvTranspose2d(base_channels, base_channels, kernel_size=2, stride=2)
+        self.up_conv4 = ConvBlock(base_channels * 2, base_channels, time_embedding_dim)
+        self.up_attn4 = AttentionBlock(base_channels, text_embedding_dim, num_heads)
         
         # Final output
         self.final_conv = nn.Conv2d(base_channels, image_channels, kernel_size=1)
@@ -128,43 +246,54 @@ class UNetHandwriting(nn.Module):
     def forward(self, x, timesteps, text_indices):
         # Get embeddings
         time_emb = self.time_embedding(timesteps)
-        text_emb = self.text_embedding(text_indices)
+        time_emb = self.time_mlp(time_emb)  # Process through MLP
+        
+        text_seq = self.text_encoder(text_indices)  # (batch, seq_len, text_dim)
         
         # Initial conv
         x = self.initial_conv(x)
         
         # Encoder with skip connections
-        skip1 = self.down1(x, time_emb, text_emb)
+        skip1 = self.down_conv1(x, time_emb)
+        skip1 = self.down_attn1(skip1, text_seq, time_emb)
         x = self.pool(skip1)
         
-        skip2 = self.down2(x, time_emb, text_emb)
+        skip2 = self.down_conv2(x, time_emb)
+        skip2 = self.down_attn2(skip2, text_seq, time_emb)
         x = self.pool(skip2)
         
-        skip3 = self.down3(x, time_emb, text_emb)
+        skip3 = self.down_conv3(x, time_emb)
+        skip3 = self.down_attn3(skip3, text_seq, time_emb)
         x = self.pool(skip3)
         
-        skip4 = self.down4(x, time_emb, text_emb)
+        skip4 = self.down_conv4(x, time_emb)
+        skip4 = self.down_attn4(skip4, text_seq, time_emb)
         x = self.pool(skip4)
         
         # Bottleneck
-        x = self.bottleneck(x, time_emb, text_emb)
+        x = self.bottleneck_conv(x, time_emb)
+        x = self.bottleneck_attn(x, text_seq, time_emb)
         
         # Decoder with skip connections
         x = self.upconv1(x)
         x = torch.cat([x, skip4], dim=1)
-        x = self.up1(x, time_emb, text_emb)
+        x = self.up_conv1(x, time_emb)
+        x = self.up_attn1(x, text_seq, time_emb)
         
         x = self.upconv2(x)
         x = torch.cat([x, skip3], dim=1)
-        x = self.up2(x, time_emb, text_emb)
+        x = self.up_conv2(x, time_emb)
+        x = self.up_attn2(x, text_seq, time_emb)
         
         x = self.upconv3(x)
         x = torch.cat([x, skip2], dim=1)
-        x = self.up3(x, time_emb, text_emb)
+        x = self.up_conv3(x, time_emb)
+        x = self.up_attn3(x, text_seq, time_emb)
         
         x = self.upconv4(x)
         x = torch.cat([x, skip1], dim=1)
-        x = self.up4(x, time_emb, text_emb)
+        x = self.up_conv4(x, time_emb)
+        x = self.up_attn4(x, text_seq, time_emb)
         
         # Final output
         x = self.final_conv(x)
