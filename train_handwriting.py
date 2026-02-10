@@ -26,20 +26,40 @@ def train_handwriting_diffusion(
     if device is None:
         if torch.cuda.is_available():
             device = 'cuda'
-        elif torch.backends.mps.is_available():
-            device = 'mps'
+            print(f"✓ CUDA available: {torch.cuda.get_device_name(0)}")
+            print(f"  Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            try:
+                # Test MPS availability
+                test_tensor = torch.tensor([1.0], device='mps')
+                del test_tensor
+                device = 'mps'
+                print("✓ Using Apple Metal Performance Shaders (MPS)")
+            except Exception as e:
+                device = 'cpu'
+                print(f"⚠ MPS detected but not working ({e}), using CPU")
         else:
             device = 'cpu'
+            print("⚠ No GPU detected, using CPU")
+            print("   For NVIDIA GPUs: Install PyTorch with CUDA support")
+            print("   Visit: https://pytorch.org/get-started/locally/")
+            print("   For Apple Silicon: Update to macOS 12.3+ and install MPS-enabled PyTorch")
+    
+    # Force device to be a torch.device object
+    device = torch.device(device)
     
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs(os.path.join(save_dir, 'samples'), exist_ok=True)
     
     # Create dataloaders
     print("Loading IAM Handwriting dataset...")
+    # Disable pin_memory for CPU, enable for GPU
+    pin_memory = device.type != 'cpu'
     train_loader, val_loader = create_handwriting_dataloaders(
         root_dir=data_dir,
         batch_size=batch_size,
-        num_workers=4
+        num_workers=4 if device.type == 'cpu' else 0,
+        pin_memory=pin_memory
     )
     
     # Create model

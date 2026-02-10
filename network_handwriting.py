@@ -21,15 +21,20 @@ class SinusoidalPositionEmbeddings(nn.Module):
         return embeddings
 
 
-def get_sinusoidal_position_encoding(seq_len, dim, device):
+def get_sinusoidal_position_encoding(seq_len, dim, device, batch_size=1):
     """Generate sinusoidal position encodings"""
-    position = torch.arange(seq_len, device=device).unsqueeze(1)
-    div_term = torch.exp(torch.arange(0, dim, 2, device=device) * (-math.log(10000.0) / dim))
+    position = torch.arange(seq_len, device=device, dtype=torch.float32).unsqueeze(1)
+    div_term = torch.exp(torch.arange(0, dim, 2, device=device, dtype=torch.float32) * (-math.log(10000.0) / dim))
     
-    pe = torch.zeros(seq_len, dim, device=device)
+    pe = torch.zeros(seq_len, dim, device=device, dtype=torch.float32)
     pe[:, 0::2] = torch.sin(position * div_term)
-    pe[:, 1::2] = torch.cos(position * div_term)
-    return pe
+    if dim % 2 == 1:
+        pe[:, 1::2] = torch.cos(position * div_term[:, :-1])
+    else:
+        pe[:, 1::2] = torch.cos(position * div_term)
+    
+    # Return with batch dimension - use repeat for proper gradient flow
+    return pe.unsqueeze(0).repeat(batch_size, 1, 1)
 
 
 class TextEncoder(nn.Module):
@@ -48,8 +53,8 @@ class TextEncoder(nn.Module):
         char_emb = self.embedding(char_indices)  # (batch, seq_len, embed_dim)
         
         # Add sinusoidal positional encodings
-        pos_enc = get_sinusoidal_position_encoding(seq_len, self.embed_dim, char_indices.device)
-        text_seq = char_emb + pos_enc.unsqueeze(0)  # (batch, seq_len, embed_dim)
+        pos_enc = get_sinusoidal_position_encoding(seq_len, self.embed_dim, char_indices.device, batch_size)
+        text_seq = char_emb + pos_enc  # (batch, seq_len, embed_dim)
         
         return text_seq  # Return as sequence, not averaged
 
@@ -114,25 +119,21 @@ class ConvBlock(nn.Module):
 
 
 class AttentionBlock(nn.Module):
-    """Attention block with cross-attention to text and self-attention"""
-    def __init__(self, channels, text_dim, num_heads=8):
+    """Lightweight attention block with only cross-attention to text"""
+    def __init__(self, channels, text_dim, num_heads=4):
         super().__init__()
         self.channels = channels
         self.num_heads = num_heads
         
-        # Cross-attention to text
+        # Cross-attention to text only (no self-attention for speed)
         self.cross_attn = nn.MultiheadAttention(channels, num_heads, batch_first=True)
         self.cross_attn_norm = nn.LayerNorm(channels)
         
-        # Self-attention
-        self.self_attn = nn.MultiheadAttention(channels, num_heads, batch_first=True)
-        self.self_attn_norm = nn.LayerNorm(channels)
-        
-        # Feed-forward network
+        # Simplified feed-forward network (2x instead of 4x)
         self.ffn = nn.Sequential(
-            nn.Linear(channels, channels * 4),
+            nn.Linear(channels, channels * 2),
             nn.GELU(),
-            nn.Linear(channels * 4, channels)
+            nn.Linear(channels * 2, channels)
         )
         self.ffn_norm = nn.LayerNorm(channels)
         
@@ -144,30 +145,27 @@ class AttentionBlock(nn.Module):
         # text_seq: (batch, seq_len, text_dim)
         
         batch, channels, h, w = x.shape
+        device = x.device
         
         # Reshape to sequence
         x_seq = x.view(batch, channels, h * w).permute(0, 2, 1)  # (batch, H*W, channels)
         
-        # Add positional encodings to queries and keys
-        spatial_pos = get_sinusoidal_position_encoding(h * w, channels, x.device)
+        # Add positional encodings
+        spatial_seq_len = h * w
+        text_seq_len = text_seq.shape[1]
         
-        # Cross-attention with text
+        spatial_pos = get_sinusoidal_position_encoding(spatial_seq_len, channels, device, batch)
+        
+        # Cross-attention with text (only cross-attention, no self-attention)
         text_proj = self.text_proj(text_seq)  # (batch, seq_len, channels)
-        text_pos = get_sinusoidal_position_encoding(text_seq.shape[1], channels, x.device)
+        text_pos = get_sinusoidal_position_encoding(text_seq_len, channels, device, batch)
         
-        q = x_seq + spatial_pos.unsqueeze(0)
-        k = text_proj + text_pos.unsqueeze(0)
+        q = x_seq + spatial_pos
+        k = text_proj + text_pos
         v = text_proj
         
         attn_out, _ = self.cross_attn(q, k, v)
         x_seq = self.cross_attn_norm(x_seq + attn_out)
-        
-        # Self-attention
-        q_self = x_seq + spatial_pos.unsqueeze(0)
-        k_self = x_seq + spatial_pos.unsqueeze(0)
-        
-        self_attn_out, _ = self.self_attn(q_self, k_self, x_seq)
-        x_seq = self.self_attn_norm(x_seq + self_attn_out)
         
         # Feed-forward
         ffn_out = self.ffn(x_seq)
@@ -205,17 +203,18 @@ class UNetHandwriting(nn.Module):
         self.initial_conv = nn.Conv2d(image_channels, base_channels, kernel_size=3, padding=1)
         
         # Encoder (downsampling) - using ConvBlocks + AttentionBlocks
+        # Note: Attention only at lowest resolutions to save computation
         self.down_conv1 = ConvBlock(base_channels, base_channels, time_embedding_dim)
-        self.down_attn1 = AttentionBlock(base_channels, text_embedding_dim, num_heads)
+        # No attention at 64x256
         
         self.down_conv2 = ConvBlock(base_channels, base_channels * 2, time_embedding_dim)
-        self.down_attn2 = AttentionBlock(base_channels * 2, text_embedding_dim, num_heads)
+        # No attention at 32x128
         
         self.down_conv3 = ConvBlock(base_channels * 2, base_channels * 4, time_embedding_dim)
-        self.down_attn3 = AttentionBlock(base_channels * 4, text_embedding_dim, num_heads)
+        # No attention at 16x64 (removed for speed)
         
         self.down_conv4 = ConvBlock(base_channels * 4, base_channels * 8, time_embedding_dim)
-        self.down_attn4 = AttentionBlock(base_channels * 8, text_embedding_dim, num_heads)
+        self.down_attn4 = AttentionBlock(base_channels * 8, text_embedding_dim, num_heads)  # 8x32 only
         
         self.pool = nn.MaxPool2d(2)
         
@@ -230,15 +229,15 @@ class UNetHandwriting(nn.Module):
         
         self.upconv2 = nn.ConvTranspose2d(base_channels * 4, base_channels * 4, kernel_size=2, stride=2)
         self.up_conv2 = ConvBlock(base_channels * 8, base_channels * 2, time_embedding_dim)
-        self.up_attn2 = AttentionBlock(base_channels * 2, text_embedding_dim, num_heads)
+        # No attention at 16x64 (removed for speed)
         
         self.upconv3 = nn.ConvTranspose2d(base_channels * 2, base_channels * 2, kernel_size=2, stride=2)
         self.up_conv3 = ConvBlock(base_channels * 4, base_channels, time_embedding_dim)
-        self.up_attn3 = AttentionBlock(base_channels, text_embedding_dim, num_heads)
+        # No attention at 32x128 - too memory intensive
         
         self.upconv4 = nn.ConvTranspose2d(base_channels, base_channels, kernel_size=2, stride=2)
         self.up_conv4 = ConvBlock(base_channels * 2, base_channels, time_embedding_dim)
-        self.up_attn4 = AttentionBlock(base_channels, text_embedding_dim, num_heads)
+        # No attention at 64x256 - too memory intensive
         
         # Final output
         self.final_conv = nn.Conv2d(base_channels, image_channels, kernel_size=1)
@@ -254,19 +253,16 @@ class UNetHandwriting(nn.Module):
         x = self.initial_conv(x)
         
         # Encoder with skip connections
-        skip1 = self.down_conv1(x, time_emb)
-        skip1 = self.down_attn1(skip1, text_seq, time_emb)
+        skip1 = self.down_conv1(x, time_emb)  # 64x256 - no attention
         x = self.pool(skip1)
         
-        skip2 = self.down_conv2(x, time_emb)
-        skip2 = self.down_attn2(skip2, text_seq, time_emb)
+        skip2 = self.down_conv2(x, time_emb)  # 32x128 - no attention
         x = self.pool(skip2)
         
-        skip3 = self.down_conv3(x, time_emb)
-        skip3 = self.down_attn3(skip3, text_seq, time_emb)
+        skip3 = self.down_conv3(x, time_emb)  # 16x64 - no attention
         x = self.pool(skip3)
         
-        skip4 = self.down_conv4(x, time_emb)
+        skip4 = self.down_conv4(x, time_emb)  # 8x32 - with attention
         skip4 = self.down_attn4(skip4, text_seq, time_emb)
         x = self.pool(skip4)
         
@@ -282,18 +278,15 @@ class UNetHandwriting(nn.Module):
         
         x = self.upconv2(x)
         x = torch.cat([x, skip3], dim=1)
-        x = self.up_conv2(x, time_emb)
-        x = self.up_attn2(x, text_seq, time_emb)
+        x = self.up_conv2(x, time_emb)  # 16x64 - no attention
         
         x = self.upconv3(x)
         x = torch.cat([x, skip2], dim=1)
-        x = self.up_conv3(x, time_emb)
-        x = self.up_attn3(x, text_seq, time_emb)
+        x = self.up_conv3(x, time_emb)  # 32x128 - no attention
         
         x = self.upconv4(x)
         x = torch.cat([x, skip1], dim=1)
-        x = self.up_conv4(x, time_emb)
-        x = self.up_attn4(x, text_seq, time_emb)
+        x = self.up_conv4(x, time_emb)  # 64x256 - no attention
         
         # Final output
         x = self.final_conv(x)

@@ -141,7 +141,7 @@ class IAMHandwritingDataset(Dataset):
         return image, text_indices, text
 
 
-def create_handwriting_dataloaders(root_dir='data/archive/iam_words', batch_size=32, num_workers=4):
+def create_handwriting_dataloaders(root_dir='data/archive/iam_words', batch_size=32, num_workers=4, pin_memory=True):
     """Create train and validation dataloaders"""
     train_dataset = IAMHandwritingDataset(root_dir, split='train')
     val_dataset = IAMHandwritingDataset(root_dir, split='val')
@@ -151,7 +151,7 @@ def create_handwriting_dataloaders(root_dir='data/archive/iam_words', batch_size
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=pin_memory
     )
     
     val_loader = torch.utils.data.DataLoader(
@@ -159,7 +159,7 @@ def create_handwriting_dataloaders(root_dir='data/archive/iam_words', batch_size
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=pin_memory
     )
     
     return train_loader, val_loader
