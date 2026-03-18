@@ -7,6 +7,9 @@ import math
 
 
 class SinusoidalPositionEmbeddings(nn.Module):
+    '''
+    
+    '''
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
@@ -22,7 +25,11 @@ class SinusoidalPositionEmbeddings(nn.Module):
 
 
 def get_sinusoidal_position_encoding(seq_len, dim, device):
-    """Generate sinusoidal position encodings"""
+    """
+    Generate sinusoidal position encodings
+    Basically, we use this for spacial positions in the image.
+    "hello" is seen as a sequence of 5 characters, so we want to encode the position of each character in the sequence.
+    """
     position = torch.arange(seq_len, device=device).unsqueeze(1)
     div_term = torch.exp(torch.arange(0, dim, 2, device=device) * (-math.log(10000.0) / dim))
     
@@ -30,7 +37,6 @@ def get_sinusoidal_position_encoding(seq_len, dim, device):
     pe[:, 0::2] = torch.sin(position * div_term)
     pe[:, 1::2] = torch.cos(position * div_term)
     return pe
-
 
 class TextEncoder(nn.Module):
     """Encodes text as a sequence with positional information preserved"""
